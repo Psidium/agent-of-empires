@@ -13,6 +13,7 @@
 //! manually with `docker volume rm aoe-claude-auth aoe-opencode-auth ...`.
 
 use anyhow::Result;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 use tracing::info;
@@ -47,28 +48,36 @@ const VOLUME_MIGRATIONS: &[VolumeMigration] = &[
     },
 ];
 
+/// Run a docker command that produces no output, returning whether it succeeded.
+fn docker_run_silent(args: &[&str], timeout: std::time::Duration) -> bool {
+    Command::new("docker")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|child| wait_with_timeout(child, timeout))
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Check whether Docker is available and the daemon is running.
 fn docker_available() -> bool {
-    Command::new("docker")
-        .arg("info")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    docker_run_silent(&["info"], std::time::Duration::from_secs(1))
 }
 
 /// Check whether a named Docker volume exists.
 fn volume_exists(name: &str) -> bool {
-    Command::new("docker")
-        .args(["volume", "inspect", name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    docker_run_silent(
+        &["volume", "inspect", name],
+        std::time::Duration::from_secs(5),
+    )
 }
 
 /// Find a container image available locally to use for volume extraction.
 /// Tries the AOE sandbox image first, then small well-known images, then
 /// falls back to whatever is locally available.
 fn find_local_image() -> Option<String> {
+    let timeout = std::time::Duration::from_secs(5);
     let candidates = [
         "ghcr.io/njbrake/aoe-sandbox:latest",
         "alpine",
@@ -78,24 +87,26 @@ fn find_local_image() -> Option<String> {
 
     // Check well-known small images first.
     for candidate in candidates {
-        let ok = Command::new("docker")
-            .args(["image", "inspect", candidate])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
+        if docker_run_silent(&["image", "inspect", candidate], timeout) {
             return Some(candidate.to_string());
         }
     }
 
     // Fall back to any locally available image.
-    let output = Command::new("docker")
+    let mut child = Command::new("docker")
         .args(["images", "-q", "--format", "{{.Repository}}:{{.Tag}}"])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
+    let stdout_handle = child.stdout.take()?;
+    let status = wait_with_timeout(child, timeout).ok()?;
+    if !status.success() {
+        return None;
+    }
+    let mut buf = String::new();
+    std::io::BufReader::new(stdout_handle).read_to_string(&mut buf).ok()?;
+    buf.lines()
         .next()
         .filter(|s| !s.is_empty() && !s.contains("<none>"))
         .map(|s| s.to_string())
@@ -112,7 +123,7 @@ fn extract_volume_to_temp(volume_name: &str, image: &str) -> Result<std::path::P
     std::fs::create_dir_all(&tmp)?;
 
     let tmp_str = tmp.to_string_lossy();
-    let output = Command::new("docker")
+    let child = Command::new("docker")
         .args([
             "run",
             "--rm",
@@ -125,16 +136,15 @@ fn extract_volume_to_temp(volume_name: &str, image: &str) -> Result<std::path::P
             "-c",
             "cp -a /vol/. /host/",
         ])
-        .output()?;
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
 
-    if !output.status.success() {
+    let status = wait_with_timeout(child, std::time::Duration::from_secs(30))?;
+
+    if !status.success() {
         let _ = std::fs::remove_dir_all(&tmp);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to extract volume {}: {}",
-            volume_name,
-            stderr.trim()
-        );
+        anyhow::bail!("Failed to extract volume {}", volume_name);
     }
 
     Ok(tmp)
